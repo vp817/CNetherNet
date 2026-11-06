@@ -66,23 +66,16 @@ jobs:
   package:
     name: Package ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
-    continue-on-error: ${{ matrix.experimental }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - name: linux-x86_64
             os: ubuntu-22.04
-            experimental: false
           - name: linux-arm64
             os: ubuntu-22.04-arm
-            experimental: false
           - name: windows-x64
             os: windows-2022
-            experimental: false
-          - name: macos-arm64
-            os: macos-14
-            experimental: true
 
     steps:
       - uses: actions/checkout@v5
@@ -94,10 +87,6 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential cmake libssl-dev
-
-      - name: Install OpenSSL (macOS)
-        if: runner.os == 'macOS'
-        run: echo "OPENSSL_ROOT=$(brew --prefix openssl@3)" >> $GITHUB_ENV
 
       - name: Install OpenSSL (Windows)
         if: runner.os == 'Windows'
@@ -141,16 +130,6 @@ jobs:
           Needs OpenSSL 3 (libssl-dev). libdatachannel inside is C++, so link the C++ runtime (-lstdc++ or build with g++).
           EOF
 
-      - name: Merge libraries (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          libtool -static -o $PKG/lib/libnethernet.a $(find build -name '*.a')
-          cat > $PKG/README.txt <<'EOF'
-          #include <nethernet/nn_peer.h>
-          clang app.c -I<this>/include -L<this>/lib -lnethernet -L$(brew --prefix openssl@3)/lib -lssl -lcrypto -lc++
-          Needs OpenSSL 3 (brew install openssl@3).
-          EOF
-
       - name: Merge libraries (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -175,7 +154,7 @@ jobs:
             zip -qr $PKG.zip $PKG
           fi
 
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v6
         with:
           name: ${{ env.PKG }}
           path: ${{ env.PKG }}.zip
