@@ -1,0 +1,6 @@
+[submodule "third_party/libdatachannel"]
+	path = third_party/libdatachannel
+	url = https://github.com/paullouisageneau/libdatachannel
+[submodule "third_party/mongoose"]
+	path = third_party/mongoose
+	url = https://github.com/cesanta/mongoose.git

@@ -1,0 +1,206 @@
+name: Build
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    name: Library - Linux
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake libssl-dev
+
+      - name: Build
+        run: |
+          cmake -S . -B build -DBUILD_NETHERNET_TESTS=TRUE -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --parallel
+
+      - name: Test
+        working-directory: build
+        run: timeout 120 ./ClientTest
+
+  windows:
+    name: Library - Windows
+    runs-on: windows-2022
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - name: Install OpenSSL
+        shell: pwsh
+        run: |
+          vcpkg install openssl:x64-windows-static-md
+          "OPENSSL_ROOT=$env:VCPKG_INSTALLATION_ROOT/installed/x64-windows-static-md" -replace '\\', '/' >> $env:GITHUB_ENV
+
+      - name: Build
+        shell: pwsh
+        run: |
+          cmake -S . -B build -A x64 -DBUILD_NETHERNET_TESTS=TRUE -DOPENSSL_ROOT_DIR="$env:OPENSSL_ROOT" -DOPENSSL_USE_STATIC_LIBS=TRUE
+          cmake --build build --config Release --parallel
+
+      - name: Test
+        shell: pwsh
+        working-directory: build/Release
+        run: |
+          ./ClientTest.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+  package:
+    name: Package ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.experimental }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-22.04
+            experimental: false
+          - name: linux-arm64
+            os: ubuntu-22.04-arm
+            experimental: false
+          - name: windows-x64
+            os: windows-2022
+            experimental: false
+          - name: macos-arm64
+            os: macos-14
+            experimental: true
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - name: Install OpenSSL (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake libssl-dev
+
+      - name: Install OpenSSL (macOS)
+        if: runner.os == 'macOS'
+        run: echo "OPENSSL_ROOT=$(brew --prefix openssl@3)" >> $GITHUB_ENV
+
+      - name: Install OpenSSL (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          vcpkg install openssl:x64-windows-static-md
+          "OPENSSL_ROOT=$env:VCPKG_INSTALLATION_ROOT/installed/x64-windows-static-md" -replace '\\', '/' >> $env:GITHUB_ENV
+
+      - name: Build
+        shell: bash
+        run: |
+          ARGS=(-DCMAKE_BUILD_TYPE=Release)
+          [ -n "${OPENSSL_ROOT:-}" ] && ARGS+=(-DOPENSSL_ROOT_DIR="$OPENSSL_ROOT")
+          [ "$RUNNER_OS" = "Windows" ] && ARGS+=(-A x64 -DOPENSSL_USE_STATIC_LIBS=TRUE)
+          cmake -S . -B build "${ARGS[@]}"
+          cmake --build build --config Release --target nethernet --parallel
+
+      - name: Headers and licenses
+        shell: bash
+        run: |
+          PKG=CNetherNet-${{ github.ref_name }}-${{ matrix.name }}
+          PKG=${PKG//\//-}
+          echo "PKG=$PKG" >> $GITHUB_ENV
+          mkdir -p $PKG/include/nethernet $PKG/lib $PKG/licenses
+          cp nethernet/nn_peer.h nethernet/nn_thread.h nethernet/nn_ivec.h $PKG/include/nethernet/
+          cp LICENSE $PKG/licenses/CNetherNet.txt
+          cp third_party/mongoose/LICENSE $PKG/licenses/mongoose.txt
+          cp third_party/libdatachannel/LICENSE $PKG/licenses/libdatachannel.txt
+          cp third_party/libdatachannel/deps/libjuice/LICENSE $PKG/licenses/libjuice.txt
+          cp third_party/libdatachannel/deps/usrsctp/LICENSE.md $PKG/licenses/usrsctp.txt
+          cp third_party/libdatachannel/deps/plog/LICENSE $PKG/licenses/plog.txt
+
+      - name: Merge libraries (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          { echo "create $PKG/lib/libnethernet.a"; find build -name '*.a' | sed 's/^/addlib /'; echo save; echo end; } | ar -M
+          strip --strip-debug $PKG/lib/libnethernet.a
+          cat > $PKG/README.txt <<'EOF'
+          #include <nethernet/nn_peer.h>
+          gcc app.c -I<this>/include -L<this>/lib -lnethernet -lssl -lcrypto -lstdc++ -lpthread -lm
+          Needs OpenSSL 3 (libssl-dev). libdatachannel inside is C++, so link the C++ runtime (-lstdc++ or build with g++).
+          EOF
+
+      - name: Merge libraries (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          libtool -static -o $PKG/lib/libnethernet.a $(find build -name '*.a')
+          cat > $PKG/README.txt <<'EOF'
+          #include <nethernet/nn_peer.h>
+          clang app.c -I<this>/include -L<this>/lib -lnethernet -L$(brew --prefix openssl@3)/lib -lssl -lcrypto -lc++
+          Needs OpenSSL 3 (brew install openssl@3).
+          EOF
+
+      - name: Merge libraries (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+          $libs = (Get-ChildItem -Recurse build -Filter *.lib | Where-Object { $_.DirectoryName -like "*Release*" }).FullName
+          $libExe = (Get-ChildItem "$vs\VC\Tools\MSVC\*\bin\Hostx64\x64\lib.exe" | Select-Object -Last 1).FullName
+          & $libExe /nologo /OUT:"$env:PKG\lib\nethernet.lib" $libs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          @(
+            '#include <nethernet/nn_peer.h>'
+            'cl /std:c17 /experimental:c11atomics /MD /I<this>\include app.c /link <this>\lib\nethernet.lib libssl.lib libcrypto.lib ws2_32.lib bcrypt.lib iphlpapi.lib crypt32.lib advapi32.lib user32.lib'
+            'Built with /MD (dynamic CRT), Release. Needs OpenSSL 3 (static or dll).'
+          ) | Set-Content "$env:PKG\README.txt"
+
+      - name: Zip
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            7z a -tzip $PKG.zip $PKG > /dev/null
+          else
+            zip -qr $PKG.zip $PKG
+          fi
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: ${{ env.PKG }}
+          path: ${{ env.PKG }}.zip
+          if-no-files-found: error
+
+  release:
+    name: Draft release
+    needs: [linux, windows, package]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/download-artifact@v6
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - uses: ncipollo/release-action@v1.20.0
+        with:
+          artifacts: artifacts/*.zip
+          name: CNetherNet ${{ github.ref_name }}
+          tag: ${{ github.ref_name }}
+          body: "Static library (Release) + headers per platform, built by: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          draft: true
+          allowUpdates: true
+          updateOnlyUnreleased: true
